@@ -452,6 +452,8 @@ impl Filesystem for SshFs {
                     let mut buffer = Vec::new();
                     if remote_file.read_to_end(&mut buffer).is_ok() {
                         local_file.write_all(&buffer).unwrap();
+                        let base_path = local_path.with_extension(format!("{}.base", local_path.extension().unwrap_or_default().to_string_lossy()));
+                        let _ = fs::copy(&local_path, &base_path);
                     }
                 }
                 Err(_) => {
@@ -637,6 +639,8 @@ impl Filesystem for SshFs {
                     let _ = fs::create_dir_all(parent);
                 }
                 let _ = fs::File::create(&local_path);
+                let base_path = local_path.with_extension(format!("{}.base", local_path.extension().unwrap_or_default().to_string_lossy()));
+                let _ = fs::File::create(&base_path);
                 
                 if let Ok(stat) = remote_file.stat() {
                     reply.created(&TTL, &sftp_stat_to_attr(ino, &stat), 0, fh, 0);
@@ -717,6 +721,41 @@ fn main() {
     let dirty_files = Arc::new(Mutex::new(HashSet::new()));
     let versions = Arc::new(Mutex::new(HashMap::new()));
 
+    let listen_signal_server = args.signal_server.clone();
+    let listen_cache_dir = PathBuf::from(&args.cache_dir);
+    let listen_remote_root = PathBuf::from(&remote_path);
+    thread::spawn(move || {
+        loop {
+            if let Ok(mut stream) = TcpStream::connect(&listen_signal_server) {
+                if stream.write_all(b"SUBSCRIBE\n").is_ok() {
+                    let reader = std::io::BufReader::new(stream);
+                    for line in std::io::BufRead::lines(reader) {
+                        if let Ok(line) = line {
+                            let parts: Vec<&str> = line.splitn(2, ' ').collect();
+                            if parts.len() == 2 && parts[0] == "INVALIDATE" {
+                                let rel = parts[1].strip_prefix("/").unwrap_or(parts[1]);
+                                let remote = listen_remote_root.join(rel);
+                                
+                                let mut hasher = Sha256::new();
+                                hasher.update(remote.to_string_lossy().as_bytes());
+                                let hash = hex::encode(hasher.finalize());
+                                let local_path = listen_cache_dir.join(&hash);
+                                let base_path = local_path.with_extension(format!("{}.base", local_path.extension().unwrap_or_default().to_string_lossy()));
+                                
+                                println!("[INVALIDATE] Server mutated file {:?}. Purging cache...", remote);
+                                let _ = fs::remove_file(&local_path);
+                                let _ = fs::remove_file(&base_path);
+                            }
+                        } else {
+                            break;
+                        }
+                    }
+                }
+            }
+            thread::sleep(Duration::from_secs(1));
+        }
+    });
+
     // Spawn Background Uploader Thread
     let bg_host = host.clone();
     let bg_port = port;
@@ -756,13 +795,41 @@ fn main() {
 
             println!("Background SFTP sync starting for {:?}", remote_path);
 
-            if let Ok(mut local_file) = fs::File::open(&local_path) {
-                if let Ok(mut remote_file) = bg_sftp.create(&remote_path) {
-                    let mut buffer = Vec::new();
-                    if local_file.read_to_end(&mut buffer).is_ok() {
-                        let _ = remote_file.write_all(&buffer);
+            let base_path = local_path.with_extension(format!("{}.base", local_path.extension().unwrap_or_default().to_string_lossy()));
+            let old_data = fs::read(&base_path).unwrap_or_default();
+            let new_data = fs::read(&local_path).unwrap_or_default();
+            
+            let sig_options = fast_rsync::SignatureOptions {
+                block_size: 2048,
+                crypto_hash_size: 8,
+            };
+            let sig = fast_rsync::Signature::calculate(&old_data, sig_options);
+            let mut delta = Vec::new();
+            fast_rsync::diff(&sig.index(), &new_data, &mut delta).unwrap();
+            
+            let rel_path = remote_path.strip_prefix(&bg_remote_root).unwrap_or(&remote_path);
+            let send_path = PathBuf::from("/").join(rel_path);
+            let msg = format!("PATCH {} {}\n", send_path.display(), delta.len());
+            
+            let mut sent_patch = false;
+            if let Some(stream) = &mut bg_signal_stream {
+                if stream.write_all(msg.as_bytes()).is_ok() && stream.write_all(&delta).is_ok() {
+                    sent_patch = true;
+                }
+            }
+            if !sent_patch {
+                if let Ok(mut new_stream) = TcpStream::connect(&signal_server) {
+                    if new_stream.write_all(msg.as_bytes()).is_ok() && new_stream.write_all(&delta).is_ok() {
+                        bg_signal_stream = Some(new_stream);
+                        sent_patch = true;
+                    } else {
+                        bg_signal_stream = None;
                     }
                 }
+            }
+            
+            if sent_patch {
+                let _ = fs::write(&base_path, &new_data);
             }
 
             let current_version = {

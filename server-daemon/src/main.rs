@@ -32,10 +32,11 @@ struct ServerDaemonFs {
     next_fh: u64,
     dirty_files: Arc<Mutex<HashSet<PathBuf>>>,
     notify: Arc<Condvar>,
+    subscribers: Arc<Mutex<Vec<std::net::TcpStream>>>,
 }
 
 impl ServerDaemonFs {
-    fn new(backing_dir: PathBuf, dirty_files: Arc<Mutex<HashSet<PathBuf>>>, notify: Arc<Condvar>) -> Self {
+    fn new(backing_dir: PathBuf, dirty_files: Arc<Mutex<HashSet<PathBuf>>>, notify: Arc<Condvar>, subscribers: Arc<Mutex<Vec<std::net::TcpStream>>>) -> Self {
         let mut inodes = HashMap::new();
         let mut paths = HashMap::new();
         let root_path = PathBuf::from("/");
@@ -52,6 +53,7 @@ impl ServerDaemonFs {
             next_fh: 1,
             dirty_files,
             notify,
+            subscribers,
         }
     }
 
@@ -64,6 +66,20 @@ impl ServerDaemonFs {
             self.inodes.insert(inode, relative_path.to_path_buf());
             self.paths.insert(relative_path.to_path_buf(), inode);
             inode
+        }
+    }
+
+    fn invalidate_client(&self, rel_path: &PathBuf) {
+        let is_dirty = {
+            let set = self.dirty_files.lock().unwrap();
+            set.contains(rel_path)
+        };
+        // Don't invalidate if the client itself is dirtying the file
+        if !is_dirty {
+            let mut subs = self.subscribers.lock().unwrap();
+            let msg = format!("INVALIDATE {}\n", PathBuf::from("/").join(rel_path).display());
+            println!("[SERVER] Broadcasting INVALIDATE for {:?}", rel_path);
+            subs.retain_mut(|stream| stream.write_all(msg.as_bytes()).is_ok());
         }
     }
 
@@ -139,6 +155,11 @@ impl Filesystem for ServerDaemonFs {
         let rel_path = parent_path.join(name);
         let real_path = self.to_real_path(&rel_path);
         
+        if self.is_dirty(&rel_path) {
+            reply.error(libc::EACCES);
+            return;
+        }
+
         let real_path = self.to_real_path(&rel_path);
 
         match fs::metadata(&real_path) {
@@ -321,12 +342,18 @@ impl Filesystem for ServerDaemonFs {
     ) {
         let rel_path = self.inodes.get(&ino).cloned().unwrap_or_default();
         
+        if self.is_dirty(&rel_path) {
+            reply.error(libc::EACCES);
+            return;
+        }
+
         let real_path = self.to_real_path(&rel_path);
 
         if let Some(file) = self.open_files.get_mut(&fh) {
             if file.seek(SeekFrom::Start(offset as u64)).is_ok() {
                 if let Ok(bytes_written) = file.write(data) {
                     reply.written(bytes_written as u32);
+                    self.invalidate_client(&rel_path);
                     return;
                 }
             }
@@ -354,12 +381,18 @@ impl Filesystem for ServerDaemonFs {
         
         let real_path = self.to_real_path(&rel_path);
 
+        if self.is_dirty(&rel_path) {
+            reply.error(libc::EACCES);
+            return;
+        }
+
         let real_path = self.to_real_path(&rel_path);
         match fs::create_dir(&real_path) {
             Ok(_) => {
                 let ino = self.get_inode(&rel_path);
                 if let Ok(meta) = fs::metadata(&real_path) {
                     reply.entry(&TTL, &fs_meta_to_attr(ino, &meta), 0);
+                    self.invalidate_client(&rel_path);
                 } else {
                     reply.error(ENOENT);
                 }
@@ -374,9 +407,17 @@ impl Filesystem for ServerDaemonFs {
         
         let real_path = self.to_real_path(&rel_path);
 
+        if self.is_dirty(&rel_path) {
+            reply.error(libc::EACCES);
+            return;
+        }
+
         let real_path = self.to_real_path(&rel_path);
         match fs::remove_file(&real_path) {
-            Ok(_) => reply.ok(),
+            Ok(_) => {
+                reply.ok();
+                self.invalidate_client(&rel_path);
+            },
             Err(_) => reply.error(EIO),
         }
     }
@@ -387,9 +428,17 @@ impl Filesystem for ServerDaemonFs {
         
         let real_path = self.to_real_path(&rel_path);
 
+        if self.is_dirty(&rel_path) {
+            reply.error(libc::EACCES);
+            return;
+        }
+
         let real_path = self.to_real_path(&rel_path);
         match fs::remove_dir(&real_path) {
-            Ok(_) => reply.ok(),
+            Ok(_) => {
+                reply.ok();
+                self.invalidate_client(&rel_path);
+            },
             Err(_) => reply.error(EIO),
         }
     }
@@ -401,10 +450,19 @@ impl Filesystem for ServerDaemonFs {
         let newparent_path = self.inodes.get(&newparent).cloned().unwrap_or_default();
         let new_rel_path = newparent_path.join(newname);
         
+        if self.is_dirty(&rel_path) || self.is_dirty(&new_rel_path) {
+            reply.error(libc::EACCES);
+            return;
+        }
+
         let real_path = self.to_real_path(&rel_path);
         let new_real_path = self.to_real_path(&new_rel_path);
         match fs::rename(&real_path, &new_real_path) {
-            Ok(_) => reply.ok(),
+            Ok(_) => {
+                reply.ok();
+                self.invalidate_client(&rel_path);
+                self.invalidate_client(&new_rel_path);
+            },
             Err(_) => reply.error(EIO),
         }
     }
@@ -424,6 +482,11 @@ impl Filesystem for ServerDaemonFs {
         
         let real_path = self.to_real_path(&rel_path);
 
+        if self.is_dirty(&rel_path) {
+            reply.error(libc::EACCES);
+            return;
+        }
+
         let real_path = self.to_real_path(&rel_path);
         match fs::File::create(&real_path) {
             Ok(file) => {
@@ -434,6 +497,7 @@ impl Filesystem for ServerDaemonFs {
                 
                 if let Ok(meta) = fs::metadata(&real_path) {
                     reply.created(&TTL, &fs_meta_to_attr(ino, &meta), 0, fh, 0);
+                    self.invalidate_client(&rel_path);
                 } else {
                     reply.error(ENOENT);
                 }
@@ -522,6 +586,9 @@ fn main() {
 
     let df_clone = Arc::clone(&dirty_files);
     let notify_clone = Arc::clone(&notify);
+    let backing_clone = backing.clone();
+    let subscribers: Arc<Mutex<Vec<std::net::TcpStream>>> = Arc::new(Mutex::new(Vec::new()));
+    let subscribers_clone = Arc::clone(&subscribers);
 
     thread::spawn(move || {
         let listener = TcpListener::bind("0.0.0.0:8080").expect("Failed to bind port 8080");
@@ -531,32 +598,58 @@ fn main() {
             if let Ok(stream) = stream {
                 let df = Arc::clone(&df_clone);
                 let notif = Arc::clone(&notify_clone);
+                let bg_backing = backing_clone.clone();
+                let subs_clone = Arc::clone(&subscribers_clone);
                 thread::spawn(move || {
-                    let reader = BufReader::new(stream);
+                    let mut reader = BufReader::new(stream.try_clone().unwrap());
                     let mut client_locks = HashSet::new();
+                    let mut line_buf = String::new();
                     
-                    for line in reader.lines() {
-                        if let Ok(line) = line {
-                            let parts: Vec<&str> = line.splitn(2, ' ').collect();
-                            if parts.len() == 2 {
-                                let cmd = parts[0];
+                    loop {
+                        line_buf.clear();
+                        if std::io::BufRead::read_line(&mut reader, &mut line_buf).unwrap_or(0) == 0 {
+                            break;
+                        }
+                        let line = line_buf.trim_end();
+                        let parts: Vec<&str> = line.splitn(3, ' ').collect();
+                        if parts.len() >= 1 {
+                            let cmd = parts[0];
+                            
+                            if cmd == "SUBSCRIBE" {
+                                subs_clone.lock().unwrap().push(stream.try_clone().unwrap());
+                                println!("[SIGNAL] Client subscribed for invalidations.");
+                            } else if parts.len() >= 2 {
                                 let path = PathBuf::from(parts[1]);
                                 
                                 if cmd == "DIRTY" {
-                                    let mut set = df.lock().unwrap();
-                                    set.insert(path.clone());
-                                    client_locks.insert(path);
-                                    println!("[SIGNAL] Marked DIRTY: {:?}", parts[1]);
-                                } else if cmd == "CLEAN" {
-                                    let mut set = df.lock().unwrap();
-                                    set.remove(&path);
-                                    client_locks.remove(&path);
-                                    println!("[SIGNAL] Marked CLEAN: {:?}", parts[1]);
-                                    notif.notify_all();
+                                let mut set = df.lock().unwrap();
+                                set.insert(path.clone());
+                                client_locks.insert(path);
+                                println!("[SIGNAL] Marked DIRTY: {:?}", parts[1]);
+                            } else if cmd == "CLEAN" {
+                                let mut set = df.lock().unwrap();
+                                set.remove(&path);
+                                client_locks.remove(&path);
+                                println!("[SIGNAL] Marked CLEAN: {:?}", parts[1]);
+                                notif.notify_all();
+                            } else if cmd == "PATCH" && parts.len() == 3 {
+                                if let Ok(len) = parts[2].parse::<usize>() {
+                                    let mut patch_data = vec![0; len];
+                                    if std::io::Read::read_exact(&mut reader, &mut patch_data).is_ok() {
+                                        println!("[SIGNAL] Applying patch of size {} to {:?}", len, path);
+                                        let rel = path.strip_prefix("/").unwrap_or(&path);
+                                        let real_path = bg_backing.join(rel);
+                                        let old_data = std::fs::read(&real_path).unwrap_or_default();
+                                        let mut new_data = Vec::new();
+                                        if fast_rsync::apply(&old_data, &patch_data, &mut new_data).is_ok() {
+                                            let _ = std::fs::write(&real_path, &new_data);
+                                        }
+                                    } else {
+                                        break;
+                                    }
+                                }
                                 }
                             }
-                        } else {
-                            break; // Read error / EOF
                         }
                     }
                     
@@ -574,7 +667,7 @@ fn main() {
         }
     });
 
-    let fs = ServerDaemonFs::new(backing.clone(), dirty_files, notify);
+    let fs = ServerDaemonFs::new(backing.clone(), dirty_files, notify, subscribers);
 
     // By not supplying kernel caching arguments and relying on passthrough defaults,
     // the kernel cache is typically bypassed for data content inside the MVP.

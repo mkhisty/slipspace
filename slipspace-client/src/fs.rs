@@ -268,6 +268,7 @@ impl Filesystem for SshFs {
                         local_file.write_all(&buffer).unwrap();
                         let base_path = local_path.with_extension(format!("{}.base", local_path.extension().unwrap_or_default().to_string_lossy()));
                         let _ = fs::copy(&local_path, &base_path);
+                        self.cache.add_file(path.clone(), buffer.len() as u64);
                     }
                 }
                 Err(_) => {
@@ -275,6 +276,8 @@ impl Filesystem for SshFs {
                     return;
                 }
             }
+        } else {
+            self.cache.touch(&path);
         }
 
         let fh = self.next_fh;
@@ -328,7 +331,11 @@ impl Filesystem for SshFs {
                 if file.seek(SeekFrom::Start(offset as u64)).is_ok() {
                     if let Ok(bytes_written) = file.write(data) {
                         self.cache.mark_dirty(&path, &mut self.signal_stream, &self.signal_server);
-                        self.cache.touch(&path);
+                        if let Ok(meta) = file.metadata() {
+                            self.cache.update_size(&path, meta.len());
+                        } else {
+                            self.cache.touch(&path);
+                        }
 
                         {
                             let mut map = self.versions.lock().unwrap();

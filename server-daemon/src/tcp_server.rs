@@ -8,21 +8,56 @@ use std::thread;
 pub fn start_tcp_listener(
     dirty_files: Arc<Mutex<HashSet<PathBuf>>>,
     notify: Arc<Condvar>,
+    target_dir: PathBuf,
     backing_dir: PathBuf,
     subscribers: Arc<Mutex<Vec<std::net::TcpStream>>>,
+    port: u16,
 ) {
     thread::spawn(move || {
-        let listener = TcpListener::bind("0.0.0.0:8080").expect("Failed to bind port 8080");
-        println!("Server daemon listening for signals on port 8080...");
+        let bind_addr = format!("127.0.0.1:{}", port);
+        let listener = TcpListener::bind(&bind_addr).unwrap_or_else(|_| panic!("Failed to bind to {}", bind_addr));
+        println!("Server daemon listening securely for signals on {}...", bind_addr);
         
+        let active_connections = Arc::new(Mutex::new(0));
+        
+        // Spawn Watchdog Thread
+        let watchdog_active = Arc::clone(&active_connections);
+        let watchdog_target = target_dir.clone();
+        let watchdog_backing = backing_dir.clone();
+        thread::spawn(move || {
+            let mut seconds_without_clients = 0;
+            loop {
+                thread::sleep(std::time::Duration::from_secs(10));
+                let count = *watchdog_active.lock().unwrap();
+                if count == 0 {
+                    seconds_without_clients += 10;
+                    if seconds_without_clients >= 60 {
+                        println!("[WATCHDOG] No clients connected for 60 seconds! Shutting down zombie server...");
+                        crate::restore_workspace(&watchdog_target, &watchdog_backing);
+                        std::process::exit(0);
+                    }
+                } else {
+                    seconds_without_clients = 0;
+                }
+            }
+        });
+
         for stream in listener.incoming() {
             if let Ok(stream) = stream {
                 let df = Arc::clone(&dirty_files);
                 let notif = Arc::clone(&notify);
+                let bg_target = target_dir.clone();
                 let bg_backing = backing_dir.clone();
                 let subs_clone = Arc::clone(&subscribers);
+                let conn_count = Arc::clone(&active_connections);
                 
                 thread::spawn(move || {
+                    {
+                        let mut c = conn_count.lock().unwrap();
+                        *c += 1;
+                        println!("[SIGNAL] Client connected. Total active connections: {}", *c);
+                    }
+                    
                     let mut reader = BufReader::new(stream.try_clone().unwrap());
                     let mut client_locks = HashSet::new();
                     let mut line_buf = String::new();
@@ -40,6 +75,10 @@ pub fn start_tcp_listener(
                             if cmd == "SUBSCRIBE" {
                                 subs_clone.lock().unwrap().push(stream.try_clone().unwrap());
                                 println!("[SIGNAL] Client subscribed for invalidations.");
+                            } else if cmd == "SHUTDOWN" {
+                                println!("[SIGNAL] Received SHUTDOWN from client. Exiting...");
+                                crate::restore_workspace(&bg_target, &bg_backing);
+                                std::process::exit(0);
                             } else if parts.len() >= 2 {
                                 let path = PathBuf::from(parts[1]);
                                 
@@ -83,6 +122,12 @@ pub fn start_tcp_listener(
                             set.remove(&path);
                         }
                         notif.notify_all();
+                    }
+                    
+                    {
+                        let mut c = conn_count.lock().unwrap();
+                        *c -= 1;
+                        println!("[SIGNAL] Client disconnected. Total active connections: {}", *c);
                     }
                 });
             }

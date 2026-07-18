@@ -67,7 +67,11 @@ impl FileCache {
                 }
 
                 let local_path = self.get_local_path(&path);
-                let _ = fs::remove_file(local_path);
+                let _ = fs::remove_file(&local_path);
+                
+                let base_path = local_path.with_extension(format!("{}.base", local_path.extension().unwrap_or_default().to_string_lossy()));
+                let _ = fs::remove_file(&base_path);
+                
                 self.current_size -= size;
             } else {
                 break;
@@ -76,6 +80,16 @@ impl FileCache {
         for (path, size) in to_restore {
             self.lru.put(path, size);
         }
+    }
+
+    pub fn update_size(&mut self, remote_path: &Path, new_size: u64) {
+        let os = self.lru.get(remote_path).copied().unwrap_or(0);
+        if self.current_size >= os {
+            self.current_size -= os;
+        }
+        self.current_size += new_size;
+        self.lru.put(remote_path.to_path_buf(), new_size);
+        self.evict_if_needed();
     }
 
     pub fn mark_dirty(&mut self, remote_path: &Path, signal_stream: &mut Option<TcpStream>, signal_server: &str) {

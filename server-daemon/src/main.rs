@@ -19,6 +19,28 @@ struct Args {
     /// The path to the directory that should be intercepted by FUSE
     #[arg(short, long)]
     path: String,
+
+    /// Port to listen on (defaults to 8080)
+    #[arg(long, default_value_t = 8080)]
+    port: u16,
+
+    /// Restore the directory from its hidden backing store and exit
+    #[arg(long, action = clap::ArgAction::SetTrue)]
+    restore: bool,
+}
+
+pub fn restore_workspace(target: &Path, backing: &Path) {
+    if backing.exists() {
+        println!("Restoring workspace {:?} from backing store...", target);
+        let _ = std::process::Command::new("fusermount3").arg("-u").arg("-z").arg(target).output();
+        if target.exists() {
+            let _ = std_fs::remove_dir_all(target);
+        }
+        std_fs::rename(backing, target).unwrap_or_else(|e| eprintln!("Failed to restore: {}", e));
+        println!("Restore complete.");
+    } else {
+        println!("No backing store found at {:?}. Nothing to restore.", backing);
+    }
 }
 
 fn main() {
@@ -34,6 +56,11 @@ fn main() {
     let mut hidden_name = String::from(".slipspace_backing_");
     hidden_name.push_str(name.to_string_lossy().as_ref());
     let backing = parent.join(hidden_name);
+
+    if args.restore {
+        restore_workspace(&target, &backing);
+        return;
+    }
 
     if backing.exists() {
         let _ = std::process::Command::new("fusermount3").arg("-u").arg("-z").arg(&target).output();
@@ -53,7 +80,7 @@ fn main() {
         }
     }
 
-    let mnt = target;
+    let mnt = target.clone();
 
     let dirty_files = Arc::new(Mutex::new(HashSet::new()));
     let notify = Arc::new(Condvar::new());
@@ -61,19 +88,21 @@ fn main() {
     let df_clone = Arc::clone(&dirty_files);
     let notify_clone = Arc::clone(&notify);
     let backing_clone = backing.clone();
+    let target_clone = target.clone();
     let subscribers: Arc<Mutex<Vec<std::net::TcpStream>>> = Arc::new(Mutex::new(Vec::new()));
     let subscribers_clone = Arc::clone(&subscribers);
 
-    start_tcp_listener(df_clone, notify_clone, backing_clone, subscribers_clone);
+    start_tcp_listener(df_clone, notify_clone, target_clone, backing_clone, subscribers_clone, args.port);
 
     let fs = ServerDaemonFs::new(backing.clone(), dirty_files, notify, subscribers);
 
     // By not supplying kernel caching arguments and relying on passthrough defaults,
     // the kernel cache is typically bypassed for data content inside the MVP.
     let mnt_clone = mnt.clone();
+    let backing_ctrlc = backing.clone();
     ctrlc::set_handler(move || {
-        println!("\nReceived Ctrl+C! Unmounting FUSE and exiting cleanly...");
-        let _ = std::process::Command::new("fusermount3").arg("-u").arg("-z").arg(&mnt_clone).output();
+        println!("\nReceived Ctrl+C! Unmounting FUSE, restoring workspace, and exiting cleanly...");
+        restore_workspace(&mnt_clone, &backing_ctrlc);
         std::process::exit(0);
     }).expect("Error setting Ctrl-C handler");
 

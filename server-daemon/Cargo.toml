@@ -1,0 +1,14 @@
+[package]
+name = "server-daemon"
+version = "0.1.0"
+edition = "2024"
+
+[dependencies]
+clap = { version = "4.6.2", features = ["derive"] }
+crossbeam-channel = "0.5.16"
+ctrlc = "3.5.2"
+env_logger = "0.11.11"
+fast_rsync = "0.2.0"
+fuser = "0.11"
+libc = "0.2.186"
+log = "0.4.33"
